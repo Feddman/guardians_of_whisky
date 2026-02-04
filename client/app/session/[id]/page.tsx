@@ -672,6 +672,7 @@ export default function SessionPage() {
           onEmote={handleEmote}
           onKick={handleKickParticipant}
           isCreator={session.creatorId === participantId}
+          whiskies={session.whiskies || []}
         />
 
         {/* Slàinte mhath Button */}
@@ -1393,6 +1394,8 @@ export default function SessionPage() {
           <Scoreboard
             whisky={scoreboardWhisky}
             totalPoints={session.totalPoints ?? 0}
+            whiskies={session.whiskies || []}
+            participants={participants}
             onClose={() => {
               setShowScoreboard(false)
               setScoreboardWhisky(null)

@@ -5,68 +5,200 @@ const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 const fs = require('fs').promises;
 const path = require('path');
+const Database = require('better-sqlite3');
 
 const app = express();
 const server = http.createServer(app);
+const IO_CORS_ORIGIN = process.env.CORS_ORIGIN || 'http://localhost:3000';
 const io = new Server(server, {
   cors: {
-    origin: "http://localhost:3000",
+    origin: IO_CORS_ORIGIN,
     methods: ["GET", "POST"]
   }
 });
 
-app.use(cors());
+app.use(cors({ origin: process.env.CORS_ORIGIN || 'http://localhost:3000' }));
 app.use(express.json({ limit: '10mb' })); // Increase limit for base64 images
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 const DATA_DIR = path.join(__dirname, '..', 'data');
-const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
-const SERIES_FILE = path.join(DATA_DIR, 'series.json');
+const DB_FILE = path.join(DATA_DIR, 'db.sqlite3');
+let db;
 
-// Ensure data directory exists
+// Ensure data directory and database exist. Migrate from old JSON files if present.
 async function ensureDataDir() {
   try {
     await fs.mkdir(DATA_DIR, { recursive: true });
+
+    // Open SQLite DB (synchronous library)
+    db = new Database(DB_FILE);
+
+    // Create tables for sessions and series
+    db.prepare(`CREATE TABLE IF NOT EXISTS sessions (
+      id TEXT PRIMARY KEY,
+      data TEXT NOT NULL
+    )`).run();
+
+    db.prepare(`CREATE TABLE IF NOT EXISTS series (
+      id TEXT PRIMARY KEY,
+      data TEXT NOT NULL
+    )`).run();
+
+    // Migrate from old JSON files if they exist
+    const SESSIONS_FILE = path.join(DATA_DIR, 'sessions.json');
+    const SERIES_FILE = path.join(DATA_DIR, 'series.json');
+
     try {
-      await fs.access(SESSIONS_FILE);
-    } catch {
-      await fs.writeFile(SESSIONS_FILE, JSON.stringify([]));
+      const sessionsStat = await fs.stat(SESSIONS_FILE);
+      if (sessionsStat && sessionsStat.isFile()) {
+        const content = await fs.readFile(SESSIONS_FILE, 'utf8');
+        const sessions = JSON.parse(content || '[]');
+        if (Array.isArray(sessions) && sessions.length > 0) {
+          const insert = db.prepare('INSERT OR REPLACE INTO sessions (id, data) VALUES (?, ?)');
+          const insertMany = db.transaction((arr) => {
+            for (const s of arr) {
+              insert.run(s.id || s.id === undefined ? (s.id || require('uuid').v4()) : require('uuid').v4(), JSON.stringify(s));
+            }
+          });
+          insertMany(sessions);
+        }
+        // Optionally keep old file as backup; no deletion performed
+      }
+    } catch (err) {
+      // ignore if no file
     }
+
     try {
-      await fs.access(SERIES_FILE);
-    } catch {
-      await fs.writeFile(SERIES_FILE, JSON.stringify([]));
+      const seriesStat = await fs.stat(SERIES_FILE);
+      if (seriesStat && seriesStat.isFile()) {
+        const content = await fs.readFile(SERIES_FILE, 'utf8');
+        const series = JSON.parse(content || '[]');
+        if (Array.isArray(series) && series.length > 0) {
+          const insert = db.prepare('INSERT OR REPLACE INTO series (id, data) VALUES (?, ?)');
+          const insertMany = db.transaction((arr) => {
+            for (const s of arr) {
+              insert.run(s.id || require('uuid').v4(), JSON.stringify(s));
+            }
+          });
+          insertMany(series);
+        }
+      }
+    } catch (err) {
+      // ignore if no file
     }
+
   } catch (error) {
-    console.error('Error setting up data directory:', error);
+    console.error('Error setting up data directory or database:', error);
+    process.exit(1);
   }
 }
 
-// Data access functions
-async function getSessions() {
+// Data access functions (SQLite-backed)
+function getSessions() {
   try {
-    const data = await fs.readFile(SESSIONS_FILE, 'utf8');
-    return JSON.parse(data);
-  } catch {
+    const rows = db.prepare('SELECT data FROM sessions').all();
+    return rows.map(r => JSON.parse(r.data));
+  } catch (err) {
+    console.error('Error reading sessions from DB:', err);
     return [];
   }
 }
 
-async function saveSessions(sessions) {
-  await fs.writeFile(SESSIONS_FILE, JSON.stringify(sessions, null, 2));
+function saveSessions(sessions) {
+  // Upsert sessions individually instead of replacing the whole table
+  try {
+    const insert = db.prepare('INSERT OR REPLACE INTO sessions (id, data) VALUES (?, ?)');
+    const upsertMany = db.transaction((arr) => {
+      for (const s of arr) {
+        const id = s.id || uuidv4();
+        insert.run(id, JSON.stringify({ ...s, id }));
+      }
+    });
+    upsertMany(sessions || []);
+  } catch (err) {
+    console.error('Error saving sessions to DB:', err);
+    throw err;
+  }
 }
 
-async function getSeries() {
+// Per-row session helpers
+const insertSessionStmt = () => db.prepare('INSERT OR REPLACE INTO sessions (id, data) VALUES (?, ?)');
+function upsertSession(session) {
   try {
-    const data = await fs.readFile(SERIES_FILE, 'utf8');
-    return JSON.parse(data);
-  } catch {
+    const id = session.id || uuidv4();
+    insertSessionStmt().run(id, JSON.stringify({ ...session, id }));
+    return { ...session, id };
+  } catch (err) {
+    console.error('Error upserting session:', err);
+    throw err;
+  }
+}
+
+// Per-row series helper
+const insertSeriesStmt = () => db.prepare('INSERT OR REPLACE INTO series (id, data) VALUES (?, ?)');
+function upsertSeriesItem(item) {
+  try {
+    const id = item.id || uuidv4();
+    insertSeriesStmt().run(id, JSON.stringify({ ...item, id }));
+    return { ...item, id };
+  } catch (err) {
+    console.error('Error upserting series item:', err);
+    throw err;
+  }
+}
+
+// Helper to find a session by id or 4-letter code
+function findSessionByIdOrCode(idOrCode) {
+  try {
+    // Try id first
+    const row = db.prepare('SELECT data FROM sessions WHERE id = ?').get(idOrCode);
+    if (row) {
+      return JSON.parse(row.data);
+    }
+
+    // Fallback to scanning for code (stored inside JSON data)
+    const rows = db.prepare('SELECT data FROM sessions').all();
+    for (const r of rows) {
+      try {
+        const parsed = JSON.parse(r.data);
+        if (parsed.code && parsed.code.toUpperCase() === String(idOrCode).toUpperCase()) {
+          return parsed;
+        }
+      } catch (e) {
+        // ignore parse errors
+      }
+    }
+    return null;
+  } catch (err) {
+    console.error('Error finding session by id or code:', err);
+    return null;
+  }
+}
+
+function getSeries() {
+  try {
+    const rows = db.prepare('SELECT data FROM series').all();
+    return rows.map(r => JSON.parse(r.data));
+  } catch (err) {
+    console.error('Error reading series from DB:', err);
     return [];
   }
 }
 
-async function saveSeries(series) {
-  await fs.writeFile(SERIES_FILE, JSON.stringify(series, null, 2));
+function saveSeries(series) {
+  try {
+    const insert = db.prepare('INSERT OR REPLACE INTO series (id, data) VALUES (?, ?)');
+    const upsertMany = db.transaction((arr) => {
+      for (const s of arr) {
+        const id = s.id || uuidv4();
+        insert.run(id, JSON.stringify({ ...s, id }));
+      }
+    });
+    upsertMany(series || []);
+  } catch (err) {
+    console.error('Error saving series to DB:', err);
+    throw err;
+  }
 }
 
 // Generate a unique 4-letter code
@@ -92,7 +224,7 @@ async function generateSessionCode() {
 }
 
 async function isCodeTaken(code) {
-  const sessions = await getSessions();
+  const sessions = getSessions();
   return sessions.some(s => s.code === code);
 }
 
@@ -255,11 +387,7 @@ app.get('/api/sessions', async (req, res) => {
 });
 
 app.get('/api/sessions/:id', async (req, res) => {
-  const sessions = await getSessions();
-  // Try to find by code first (4 letters), then by ID
-  const session = sessions.find(s => 
-    s.code === req.params.id.toUpperCase() || s.id === req.params.id
-  );
+  const session = findSessionByIdOrCode(req.params.id);
   if (!session) {
     return res.status(404).json({ error: 'Session not found' });
   }
@@ -271,8 +399,7 @@ app.get('/api/sessions/:id', async (req, res) => {
 });
 
 app.get('/api/sessions/code/:code', async (req, res) => {
-  const sessions = await getSessions();
-  const session = sessions.find(s => s.code === req.params.code.toUpperCase());
+  const session = findSessionByIdOrCode(req.params.code);
   if (!session) {
     return res.status(404).json({ error: 'Session not found' });
   }
@@ -281,7 +408,6 @@ app.get('/api/sessions/code/:code', async (req, res) => {
 
 app.post('/api/sessions', async (req, res) => {
   try {
-    const sessions = await getSessions();
     const code = await generateSessionCode();
     const newSession = {
       id: uuidv4(),
@@ -298,10 +424,10 @@ app.post('/api/sessions', async (req, res) => {
       totalPoints: 0,
       createdAt: new Date().toISOString()
     };
-    sessions.push(newSession);
-    await saveSessions(sessions);
-    io.emit('session:created', newSession);
-    res.json(newSession);
+
+    const saved = upsertSession(newSession);
+    io.emit('session:created', saved);
+    res.json(saved);
   } catch (error) {
     console.error('Error creating session:', error);
     res.status(500).json({ error: 'Failed to create session' });
@@ -309,14 +435,9 @@ app.post('/api/sessions', async (req, res) => {
 });
 
 app.post('/api/sessions/:id/whisky', async (req, res) => {
-  const sessions = await getSessions();
-  const session = sessions.find(s => 
-    s.code === req.params.id.toUpperCase() || s.id === req.params.id
-  );
-  if (!session) {
-    return res.status(404).json({ error: 'Session not found' });
-  }
-  
+  const session = findSessionByIdOrCode(req.params.id);
+  if (!session) return res.status(404).json({ error: 'Session not found' });
+
   const whisky = {
     id: uuidv4(),
     name: req.body.name || 'Unknown Whisky',
@@ -328,28 +449,21 @@ app.post('/api/sessions/:id/whisky', async (req, res) => {
     revealed: false,
     ratings: []
   };
-  
+
+  session.whiskies = session.whiskies || [];
   session.whiskies.push(whisky);
-  await saveSessions(sessions);
-  // Use session ID for WebSocket room
+  upsertSession(session);
   io.to(session.id).emit('whisky:added', whisky);
   res.json(whisky);
 });
 
 app.post('/api/sessions/:sessionId/whisky/:whiskyId/rate', async (req, res) => {
-  const sessions = await getSessions();
-  const session = sessions.find(s => 
-    s.code === req.params.sessionId.toUpperCase() || s.id === req.params.sessionId
-  );
-  if (!session) {
-    return res.status(404).json({ error: 'Session not found' });
-  }
-  
-  const whisky = session.whiskies.find(w => w.id === req.params.whiskyId);
-  if (!whisky) {
-    return res.status(404).json({ error: 'Whisky not found' });
-  }
-  
+  const session = findSessionByIdOrCode(req.params.sessionId);
+  if (!session) return res.status(404).json({ error: 'Session not found' });
+
+  const whisky = (session.whiskies || []).find(w => w.id === req.params.whiskyId);
+  if (!whisky) return res.status(404).json({ error: 'Whisky not found' });
+
   const rating = {
     id: uuidv4(),
     participantId: req.body.participantId || uuidv4(),
@@ -360,241 +474,143 @@ app.post('/api/sessions/:sessionId/whisky/:whiskyId/rate', async (req, res) => {
     finish: req.body.finish,
     overall: req.body.overall,
     flavorNotes: req.body.flavorNotes || [],
+    aromaIntensity: req.body.aromaIntensity,
+    aromaSmokiness: req.body.aromaSmokiness,
+    aromaSweetness: req.body.aromaSweetness,
     timestamp: new Date().toISOString()
   };
-  
-  // Remove existing rating from same participant
-  whisky.ratings = whisky.ratings.filter(r => r.participantId !== rating.participantId);
+
+  whisky.ratings = (whisky.ratings || []).filter(r => r.participantId !== rating.participantId);
   whisky.ratings.push(rating);
-  
-  // Don't calculate points here - only calculate on reveal
-  await saveSessions(sessions);
-  // Use session ID for WebSocket room
+
+  upsertSession(session);
   io.to(session.id).emit('rating:updated', {
     whiskyId: req.params.whiskyId,
     rating,
     totalPoints: session.totalPoints || 0
   });
-  
+
   res.json({ rating, totalPoints: session.totalPoints || 0 });
 });
 
 app.post('/api/sessions/:sessionId/whisky/:whiskyId/activate', async (req, res) => {
-  const sessions = await getSessions();
-  const session = sessions.find(s => 
-    s.code === req.params.sessionId.toUpperCase() || s.id === req.params.sessionId
-  );
-  if (!session) {
-    return res.status(404).json({ error: 'Session not found' });
-  }
-  
-  // Check if user is the creator
+  const session = findSessionByIdOrCode(req.params.sessionId);
+  if (!session) return res.status(404).json({ error: 'Session not found' });
+
   if (session.creatorId && session.creatorId !== req.body.participantId) {
     return res.status(403).json({ error: 'Only the session creator can activate whiskies' });
   }
-  
-  const whisky = session.whiskies.find(w => w.id === req.params.whiskyId);
-  if (!whisky) {
-    return res.status(404).json({ error: 'Whisky not found' });
-  }
-  
-  // Don't allow activating already revealed whiskies
-  if (whisky.revealed) {
-    return res.status(400).json({ error: 'Cannot activate an already revealed whisky' });
-  }
-  
+
+  const whisky = (session.whiskies || []).find(w => w.id === req.params.whiskyId);
+  if (!whisky) return res.status(404).json({ error: 'Whisky not found' });
+  if (whisky.revealed) return res.status(400).json({ error: 'Cannot activate an already revealed whisky' });
+
   session.activeWhiskyId = req.params.whiskyId;
-  await saveSessions(sessions);
-  
-  // Use session ID for WebSocket room
-  io.to(session.id).emit('whisky:activated', {
-    whiskyId: req.params.whiskyId,
-    whisky
-  });
-  
+  upsertSession(session);
+
+  io.to(session.id).emit('whisky:activated', { whiskyId: req.params.whiskyId, whisky });
   res.json({ activeWhiskyId: session.activeWhiskyId });
 });
 
 app.post('/api/sessions/:sessionId/whisky/:whiskyId/cancel', async (req, res) => {
-  const sessions = await getSessions();
-  const session = sessions.find(s => 
-    s.code === req.params.sessionId.toUpperCase() || s.id === req.params.sessionId
-  );
-  if (!session) {
-    return res.status(404).json({ error: 'Session not found' });
-  }
-  
-  // Check if user is the creator
+  const session = findSessionByIdOrCode(req.params.sessionId);
+  if (!session) return res.status(404).json({ error: 'Session not found' });
+
   if (session.creatorId && session.creatorId !== req.body.participantId) {
     return res.status(403).json({ error: 'Only the session creator can cancel whiskies' });
   }
-  
-  const whisky = session.whiskies.find(w => w.id === req.params.whiskyId);
-  if (!whisky) {
-    return res.status(404).json({ error: 'Whisky not found' });
-  }
-  
-  // Don't allow canceling already revealed whiskies
-  if (whisky.revealed) {
-    return res.status(400).json({ error: 'Cannot cancel an already revealed whisky' });
-  }
-  
-  // Clear all ratings for this whisky
+
+  const whisky = (session.whiskies || []).find(w => w.id === req.params.whiskyId);
+  if (!whisky) return res.status(404).json({ error: 'Whisky not found' });
+  if (whisky.revealed) return res.status(400).json({ error: 'Cannot cancel an already revealed whisky' });
+
   whisky.ratings = [];
-  
-  // Deactivate the whisky if it's currently active
-  if (session.activeWhiskyId === req.params.whiskyId) {
-    session.activeWhiskyId = null;
-  }
-  
-  await saveSessions(sessions);
-  
-  // Use session ID for WebSocket room
-  io.to(session.id).emit('whisky:cancelled', {
-    whiskyId: req.params.whiskyId,
-    whisky
-  });
-  
+  if (session.activeWhiskyId === req.params.whiskyId) session.activeWhiskyId = null;
+
+  upsertSession(session);
+  io.to(session.id).emit('whisky:cancelled', { whiskyId: req.params.whiskyId, whisky });
   res.json({ success: true, whisky });
 });
 
 app.post('/api/sessions/:sessionId/whisky/:whiskyId/reveal', async (req, res) => {
-  const sessions = await getSessions();
-  const session = sessions.find(s => 
-    s.code === req.params.sessionId.toUpperCase() || s.id === req.params.sessionId
-  );
-  if (!session) {
-    return res.status(404).json({ error: 'Session not found' });
-  }
-  
-  // Check if user is the creator
+  const session = findSessionByIdOrCode(req.params.sessionId);
+  if (!session) return res.status(404).json({ error: 'Session not found' });
+
   if (session.creatorId && session.creatorId !== req.body.participantId) {
     return res.status(403).json({ error: 'Only the session creator can reveal whiskies' });
   }
-  
-  const whisky = session.whiskies.find(w => w.id === req.params.whiskyId);
-  if (!whisky) {
-    return res.status(404).json({ error: 'Whisky not found' });
-  }
-  
+
+  const whisky = (session.whiskies || []).find(w => w.id === req.params.whiskyId);
+  if (!whisky) return res.status(404).json({ error: 'Whisky not found' });
+
   whisky.revealed = true;
-  if (!session.revealedWhiskies.includes(req.params.whiskyId)) {
-    session.revealedWhiskies.push(req.params.whiskyId);
-  }
-  
-  // Calculate points only when revealing (based on matching ratings, not star ratings)
-  const pointsResult = calculatePoints(whisky.ratings);
+  session.revealedWhiskies = session.revealedWhiskies || [];
+  if (!session.revealedWhiskies.includes(req.params.whiskyId)) session.revealedWhiskies.push(req.params.whiskyId);
+
+  const pointsResult = calculatePoints(whisky.ratings || []);
   const whiskyPoints = pointsResult.total;
   whisky.points = whiskyPoints;
   whisky.pointsBreakdown = pointsResult.breakdown;
-  
-  // Add points to total (only count once per whisky)
+
   if (!whisky.pointsCalculated) {
     session.totalPoints = (session.totalPoints || 0) + whiskyPoints;
     whisky.pointsCalculated = true;
   }
-  
-  // Clear active whisky if this was the active one
-  if (session.activeWhiskyId === req.params.whiskyId) {
-    session.activeWhiskyId = null;
-  }
-  
-  await saveSessions(sessions);
-  // Use session ID for WebSocket room
+
+  if (session.activeWhiskyId === req.params.whiskyId) session.activeWhiskyId = null;
+
+  upsertSession(session);
   io.to(session.id).emit('whisky:revealed', {
     whiskyId: req.params.whiskyId,
     whisky,
-    whiskyPoints: whiskyPoints,
+    whiskyPoints,
     totalPoints: session.totalPoints,
     pointsBreakdown: pointsResult.breakdown
   });
-  
+
   res.json({ whisky, whiskyPoints, totalPoints: session.totalPoints, pointsBreakdown: pointsResult.breakdown });
 });
 
 app.post('/api/sessions/:sessionId/participants/:participantId/kick', async (req, res) => {
-  const sessions = await getSessions();
-  const session = sessions.find(s => 
-    s.code === req.params.sessionId.toUpperCase() || s.id === req.params.sessionId
-  );
-  if (!session) {
-    return res.status(404).json({ error: 'Session not found' });
-  }
-  
-  // Check if requester is the creator
+  const session = findSessionByIdOrCode(req.params.sessionId);
+  if (!session) return res.status(404).json({ error: 'Session not found' });
+
   const requesterId = req.body.participantId;
   if (session.creatorId && session.creatorId !== requesterId) {
     return res.status(403).json({ error: 'Only the session creator can kick participants' });
   }
-  
+
   const kickedParticipantId = req.params.participantId;
-  
-  // Don't allow kicking the creator
-  if (kickedParticipantId === session.creatorId) {
-    return res.status(400).json({ error: 'Cannot kick the session creator' });
-  }
-  
-  // Don't allow kicking yourself
-  if (kickedParticipantId === requesterId) {
-    return res.status(400).json({ error: 'Cannot kick yourself' });
-  }
-  
-  // Remove participant from active participants
+  if (kickedParticipantId === session.creatorId) return res.status(400).json({ error: 'Cannot kick the session creator' });
+  if (kickedParticipantId === requesterId) return res.status(400).json({ error: 'Cannot kick yourself' });
+
   if (activeParticipants.has(session.id)) {
     const sessionParticipants = activeParticipants.get(session.id);
     const kickedParticipant = sessionParticipants.get(kickedParticipantId);
-    
     if (kickedParticipant) {
-      // Get the socket ID to disconnect them
       const socketId = kickedParticipant.socketId;
-      
-      // Remove from active participants
       sessionParticipants.delete(kickedParticipantId);
-      
-      // Emit kick event to all participants in the session
-      io.to(session.id).emit('participant:kicked', { 
-        participantId: kickedParticipantId,
-        reason: 'Kicked by creator'
-      });
-      
-      // Disconnect the kicked participant's socket
+      io.to(session.id).emit('participant:kicked', { participantId: kickedParticipantId, reason: 'Kicked by creator' });
       if (socketId) {
         const kickedSocket = io.sockets.sockets.get(socketId);
-        if (kickedSocket) {
-          kickedSocket.disconnect(true);
-        }
+        if (kickedSocket) kickedSocket.disconnect(true);
       }
     }
   }
-  
+
   res.json({ success: true, kickedParticipantId });
 });
 
 app.patch('/api/sessions/:sessionId/settings', async (req, res) => {
-  const sessions = await getSessions();
-  const session = sessions.find(s => 
-    s.code === req.params.sessionId.toUpperCase() || s.id === req.params.sessionId
-  );
-  if (!session) {
-    return res.status(404).json({ error: 'Session not found' });
-  }
-  
-  // Check if user is the creator
-  if (session.creatorId && !req.body.participantId) {
-    // We'll need to pass participantId in the request body or check via session
-    // For now, we'll allow if no creatorId is set, or check via a different method
-  }
-  
-  // Update maxFlavorNotes if provided
+  const session = findSessionByIdOrCode(req.params.sessionId);
+  if (!session) return res.status(404).json({ error: 'Session not found' });
+
   if (req.body.maxFlavorNotes !== undefined) {
     session.maxFlavorNotes = req.body.maxFlavorNotes;
   }
-  
-  await saveSessions(sessions);
-  
-  // Emit update to all clients
+
+  upsertSession(session);
   io.to(session.id).emit('session:updated', session);
-  
   res.json(session);
 });
 
@@ -604,16 +620,14 @@ app.get('/api/series', async (req, res) => {
 });
 
 app.post('/api/series', async (req, res) => {
-  const series = await getSeries();
   const newSeries = {
     id: uuidv4(),
     name: req.body.name || 'New Series',
     description: req.body.description || '',
     createdAt: new Date().toISOString()
   };
-  series.push(newSeries);
-  await saveSeries(series);
-  res.json(newSeries);
+  const saved = upsertSeriesItem(newSeries);
+  res.json(saved);
 });
 
 // Store active participants per session

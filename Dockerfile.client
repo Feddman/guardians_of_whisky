@@ -1,0 +1,35 @@
+# Multi-stage Dockerfile for Next.js client
+# Build stage
+FROM node:20-bullseye-slim AS builder
+WORKDIR /app
+
+# Install build dependencies for some native modules (if needed)
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends python3 build-essential ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+# Copy client package files and install
+COPY client/package.json client/package-lock.json ./
+RUN npm ci
+
+# Copy the rest of the client and build
+COPY client/ ./
+RUN npm run build
+
+# Run stage
+FROM node:20-bullseye-slim
+WORKDIR /app
+ENV NODE_ENV=production
+
+# Install runtime deps
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/ .
+
+# Use production install to reduce size
+RUN npm ci --production
+
+EXPOSE 3000
+CMD ["npm", "start"]
