@@ -13,6 +13,7 @@ interface Whisky {
 
 interface Session {
   id: string
+  code?: string
   date: string
   location: string
   whiskies: Whisky[]
